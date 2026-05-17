@@ -4,16 +4,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
-permissions:
-  contents: write
-  pull-requests: write
-
+# Dual-role caller: oitray/templates hosts the reusable workflow at
+# .github/workflows/auto-merge.yml AND needs its own PRs to auto-merge.
+# A second file with a distinct name avoids the filename collision —
+# this file is a caller, auto-merge.yml is the reusable.
 jobs:
-  enable-auto-merge:
-    runs-on: ubuntu-latest
-    if: github.event.pull_request.draft == false
-    steps:
-      - env:
-          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr merge "$PR_URL" --auto --squash
+  auto-merge:
+    uses: ./.github/workflows/auto-merge.yml
+    secrets:
+      merge_token: ${{ secrets.PROJECT_TOKEN }}
