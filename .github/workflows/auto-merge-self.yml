@@ -13,3 +13,7 @@ jobs:
     uses: ./.github/workflows/auto-merge.yml
     secrets:
       merge_token: ${{ secrets.PROJECT_TOKEN }}
+      # Without these, this repo's own PRs merge on PROJECT_TOKEN — the shared
+      # per-user GraphQL bucket — which is exactly what failed on PR #4's first run.
+      app_id: ${{ secrets.CI_APP_ID }}
+      app_private_key: ${{ secrets.CI_APP_PRIVATE_KEY }}
