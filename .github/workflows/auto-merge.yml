@@ -94,10 +94,15 @@ jobs:
           else
             echo "Disabling auto-merge due to hold label"
           fi
-          # Fail-closed: capture stderr and exit non-zero if gh fails
-          if ! disable_stderr=$(gh pr merge "$PR_URL" --disable-auto 2>&1); then
-            echo "ERROR: Failed to disable auto-merge: $disable_stderr"
-            exit 1
+          # Fail-closed: ignore benign errors (already disabled / closed), fail on real errors
+          if ! output=$(gh pr merge "$PR_URL" --disable-auto 2>&1); then
+            if echo "$output" | grep -qiE "(auto-merge is not enabled|pull request.*closed)"; then
+              echo "Auto-merge was already disabled or PR is closed: $output"
+              exit 0
+            else
+              echo "ERROR: Failed to disable auto-merge: $output"
+              exit 1
+            fi
           fi
           exit 0
 
@@ -151,8 +156,7 @@ jobs:
         if: |
           steps.check_hold.outputs.has_hold == 'false' &&
           steps.check_review.outputs.review_gate_status != 'success' &&
-          steps.check_review.outputs.review_gate_status != 'skip' &&
-          steps.check_review.outputs.review_gate_status != ''
+          steps.check_review.outputs.review_gate_status != 'skip'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.merge_token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -168,10 +172,15 @@ jobs:
               echo "Disabling auto-merge: fleet-review status is not success"
               ;;
           esac
-          # Fail-closed: capture stderr and exit non-zero if gh fails
-          if ! disable_stderr=$(gh pr merge "$PR_URL" --disable-auto 2>&1); then
-            echo "ERROR: Failed to disable auto-merge: $disable_stderr"
-            exit 1
+          # Fail-closed: ignore benign errors (already disabled / closed), fail on real errors
+          if ! output=$(gh pr merge "$PR_URL" --disable-auto 2>&1); then
+            if echo "$output" | grep -qiE "(auto-merge is not enabled|pull request.*closed)"; then
+              echo "Auto-merge was already disabled or PR is closed: $output"
+              exit 0
+            else
+              echo "ERROR: Failed to disable auto-merge: $output"
+              exit 1
+            fi
           fi
           exit 0
 
