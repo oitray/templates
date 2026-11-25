@@ -6,6 +6,13 @@ on:
       merge_method:
         type: string
         default: squash
+      require_review_gate:
+        type: boolean
+        default: true
+        # Set require_review_gate: false in the caller workflow to skip the
+        # fleet-review gate for bot/fleet branches. Use when the caller repo
+        # does not use fleet-review or wants to opt out of that gate.
+        description: When true, bot/fleet branches must have fleet-review=success before auto-merge is enabled
     secrets:
       merge_token:
         required: true
@@ -27,7 +34,10 @@ permissions:
 jobs:
   enable-auto-merge:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.draft == false
+    # Fail closed: never auto-merge draft PRs or PRs from forks
+    if: |
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
       # `gh pr merge --auto` is a GraphQL call and GitHub's GraphQL bucket is per
       # USER, so merge_token shares one 5,000 pts/hr counter with every interactive
@@ -47,8 +57,143 @@ jobs:
           app-id: ${{ secrets.app_id }}
           private-key: ${{ secrets.app_private_key }}
 
-      - env:
+      - name: Check for hold label (live, fail-closed)
+        id: check_hold
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.merge_token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          if ! labels_json=$(gh pr view "$PR_URL" --json labels 2>&1); then
+            echo "ERROR: Failed to fetch PR labels: $labels_json"
+            echo "has_hold=lookup_failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Validate JSON structure before attempting jq parse (fail-closed)
+          if ! echo "$labels_json" | jq empty 2>/dev/null; then
+            echo "ERROR: Invalid JSON response from gh pr view"
+            echo "has_hold=lookup_failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if echo "$labels_json" | jq -e '.labels[] | select(.name == "hold")' >/dev/null; then
+            echo "has_hold=true" >> "$GITHUB_OUTPUT"
+            echo "Hold label detected on PR"
+          else
+            echo "has_hold=false" >> "$GITHUB_OUTPUT"
+            echo "No hold label on PR"
+          fi
+
+      - name: Disable auto-merge if hold label present or lookup failed
+        if: steps.check_hold.outputs.has_hold == 'true' || steps.check_hold.outputs.has_hold == 'lookup_failed'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.merge_token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          if [ "${{ steps.check_hold.outputs.has_hold }}" = "lookup_failed" ]; then
+            echo "Disabling auto-merge due to label lookup failure (fail-closed)"
+          else
+            echo "Disabling auto-merge due to hold label"
+          fi
+          # Fail-closed: ignore benign errors (already disabled / closed), fail on real errors
+          if ! output=$(gh pr merge "$PR_URL" --disable-auto 2>&1); then
+            if echo "$output" | grep -qiE "(auto-merge is not enabled|pull request.*closed)"; then
+              echo "Auto-merge was already disabled or PR is closed: $output"
+              exit 0
+            else
+              echo "ERROR: Failed to disable auto-merge: $output"
+              exit 1
+            fi
+          fi
+          exit 0
+
+      - name: Check fleet-review status for bot/fleet branches
+        id: check_review
+        if: steps.check_hold.outputs.has_hold == 'false' && inputs.require_review_gate == true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.merge_token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Check if branch matches bot/fleet pattern
+          if [[ "$HEAD_REF" =~ ^(cursor|codex|claude)/ ]] || [[ "$HEAD_REF" =~ ^(feat|fix|chore|docs|refactor|test|perf|data|plan)/[0-9a-z]{9}- ]]; then
+            echo "Branch '$HEAD_REF' matches bot/fleet pattern, checking fleet-review status"
+
+            if ! status_json=$(gh api "/repos/$REPO/commits/$HEAD_SHA/status" 2>&1); then
+              echo "ERROR: Failed to fetch commit status: $status_json"
+              echo "review_gate_status=lookup_failed" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            fleet_review_state=$(echo "$status_json" | jq -r '.statuses[] | select(.context == "fleet-review") | .state // empty')
+
+            if [ -z "$fleet_review_state" ]; then
+              echo "fleet-review status not found on commit"
+              echo "review_gate_status=missing" >> "$GITHUB_OUTPUT"
+            elif [ "$fleet_review_state" = "success" ]; then
+              echo "fleet-review status is success"
+              echo "review_gate_status=success" >> "$GITHUB_OUTPUT"
+            else
+              echo "fleet-review status is '$fleet_review_state' (not success)"
+              echo "review_gate_status=not_success" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Branch '$HEAD_REF' does not match bot/fleet pattern, skipping review gate"
+            echo "review_gate_status=skip" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Explicit skip step when require_review_gate is false
+      - name: Skip review gate check
+        id: skip_review_gate
+        if: steps.check_hold.outputs.has_hold == 'false' && inputs.require_review_gate == false
+        run: |
+          echo "Review gate disabled by caller (require_review_gate: false)"
+          echo "review_gate_status=skip" >> "$GITHUB_OUTPUT"
+
+      - name: Disable auto-merge if review gate not satisfied
+        if: |
+          steps.check_hold.outputs.has_hold == 'false' &&
+          steps.check_review.outputs.review_gate_status != 'success' &&
+          steps.check_review.outputs.review_gate_status != 'skip'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.merge_token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          case "${{ steps.check_review.outputs.review_gate_status }}" in
+            lookup_failed)
+              echo "Disabling auto-merge due to fleet-review status lookup failure (fail-closed)"
+              ;;
+            missing)
+              echo "Disabling auto-merge: fleet-review status not found (bot/fleet branch requires review)"
+              ;;
+            not_success)
+              echo "Disabling auto-merge: fleet-review status is not success"
+              ;;
+          esac
+          # Fail-closed: ignore benign errors (already disabled / closed), fail on real errors
+          if ! output=$(gh pr merge "$PR_URL" --disable-auto 2>&1); then
+            if echo "$output" | grep -qiE "(auto-merge is not enabled|pull request.*closed)"; then
+              echo "Auto-merge was already disabled or PR is closed: $output"
+              exit 0
+            else
+              echo "ERROR: Failed to disable auto-merge: $output"
+              exit 1
+            fi
+          fi
+          exit 0
+
+      - name: Enable auto-merge if all gates pass
+        if: |
+          steps.check_hold.outputs.has_hold == 'false' &&
+          (steps.check_review.outputs.review_gate_status == 'success' ||
+           steps.check_review.outputs.review_gate_status == 'skip' ||
+           steps.skip_review_gate.outputs.review_gate_status == 'skip')
+        env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.merge_token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           METHOD: ${{ inputs.merge_method }}
-        run: gh pr merge "$PR_URL" --auto --"$METHOD"
+        run: |
+          echo "All gates passed, enabling auto-merge with method: $METHOD"
+          gh pr merge "$PR_URL" --auto --"$METHOD"
